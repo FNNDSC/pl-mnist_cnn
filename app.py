@@ -1,231 +1,181 @@
 #!/usr/bin/env python
+"""pl-mnist_cnn: train, evaluate, or predict with a small CNN on MNIST digits, as a ChRIS plugin."""
 
-import os
-import sys
-from pathlib import Path
-from argparse import ArgumentParser, Namespace, ArgumentDefaultsHelpFormatter
-
-from chris_plugin import chris_plugin, PathMapper
-
-# Imports for MNIST classifier code package. See source code in /MNIST_root
-# Custom imports
-from MNIST_root.config import TrainConfig, EvalConfig
-from MNIST_root.data import mnist_loaders
-from MNIST_root.engine import train_model
-from MNIST_root.models import SimpleCNN
-from MNIST_root.utils import get_device, load_checkpoint, MNIST_MEAN_STD, resolve_path, preprocess_image, _eval, print_dir_tree, prep_dataset_root, _is_info_probe
-
-from torchvision import transforms
-from PIL import Image
-import torch
 import csv
+import sys
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace
+from pathlib import Path
+
+from chris_plugin import PathMapper, chris_plugin
+
+from mnist_cnn.config import TrainConfig
+from mnist_cnn.data import mnist_loaders
+from mnist_cnn.engine import evaluate_model, train_model
+from mnist_cnn.models import SimpleCNN
+from mnist_cnn.utils import get_device, load_checkpoint, predict_image, resolve_path
 
 __version__ = '1.0.0'
 
 DISPLAY_TITLE = r"""
-ChRIS Plugin: MNIST Classifier for Federated Learning Validation
+pl-mnist_cnn: a small CNN for MNIST digits
 """
 
 
-parser = ArgumentParser(description=("Train/Evaluate/Predict an MNIST classifier as a ChRIS plugin.\n"
-                                    "Usage pattern follows ChRIS spec:\n"
-                                    "  chrNIST [--mode] [--options...] inputdir/ outputdir/\n"
-                                    "Where `inputdir` may contain images (for --mode predict) and\n"
-                                    "`outputdir` will receive checkpoints and result files."),
-                        formatter_class=ArgumentDefaultsHelpFormatter)
+parser = ArgumentParser(
+    description=(
+        "Train, evaluate, or predict with a small CNN on MNIST handwritten digits. "
+        "In predict mode the input directory holds the images and the checkpoint; "
+        "the output directory receives checkpoints, metrics and predictions."
+    ),
+    formatter_class=ArgumentDefaultsHelpFormatter,
+)
 
-# Top level argument to specify mode, hyperparameter input arguments depend on this.
-parser.add_argument("--mode",
-                    choices=["train", "eval", "predict"],
-                    required=True,
-                    help="Which operation to run. The choices are 'train', 'eval', or 'predict ")
+parser.add_argument("--mode", choices=["train", "eval", "predict"], required=True,
+                    help="what to do: train a model, evaluate one on the MNIST test set, "
+                         "or predict the digit in each input image")
 
-# Training options (specify hyperparameters)
-parser.add_argument("--epochs", type=int, default=TrainConfig.epochs, help="Number of training epochs")
-parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size, help="Batch size")
-parser.add_argument("--lr", type=float, default=TrainConfig.lr, help="Learning rate")
-parser.add_argument("--seed", type=int, default=TrainConfig.seed, help="Seed")
-parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers, help="Number of workers")
-parser.add_argument("--device", type=str, default=TrainConfig.device, choices=["auto", "cpu", "cuda", "mps"], help="CPU, CUDA MPS, or auto")
-parser.add_argument("--amp", action="store_true", default=TrainConfig.amp, help="Enable mixed precision if supported.")
-parser.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay, help="Weight decay")
+# training
+parser.add_argument("--epochs", type=int, default=TrainConfig.epochs, help="number of training epochs")
+parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size, help="batch size")
+parser.add_argument("--lr", type=float, default=TrainConfig.lr, help="learning rate")
+parser.add_argument("--seed", type=int, default=TrainConfig.seed, help="random seed")
+parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers,
+                    help="data loader worker processes; 0 loads in the main process")
+parser.add_argument("--device", type=str, default=TrainConfig.device,
+                    choices=["auto", "cpu", "cuda", "mps"], help="where to compute")
+parser.add_argument("--amp", action="store_true", default=TrainConfig.amp,
+                    help="train with mixed precision; has an effect on a CUDA device only")
+parser.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay, help="weight decay")
 
-# eval and predict options
-parser.add_argument("--weights", type=str, help="Path to checkpoint (.ckpt). If relative, resolved path against inputdir.")
-parser.add_argument("--image", type=str, help="Image file (PNG/JPG). If relative, resolved path against inputdir.") # Predicting on a signle image
+# eval and predict
+parser.add_argument("--weights", type=str, default="best.ckpt",
+                    help="checkpoint to load; a relative path is under the input directory")
+parser.add_argument("--image", type=str, default="",
+                    help="predict this one image; a relative path is under the input directory. "
+                         "Without it, every image matching --pattern is predicted")
 parser.add_argument("--pattern", type=str, default="**/*.png",
-                    help="Glob pattern (relative to inputdir) for batch prediction, e.g. '**/*.png'. "
-                         "Used only when --image is NOT given.")            # This is for predicting on a batch or folder of images
+                    help="glob, under the input directory, of the images to predict "
+                         "when --image is not given")
 parser.add_argument("--suffix", type=str, default=".pred.txt",
-                    help="Suffix for per-file outputs in batch mode, e.g., '.pred.txt' or '.json'.")
+                    help="suffix of the per-image result files written in batch prediction")
 
-parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {__version__}', help="Version")
+parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {__version__}')
 
 
-# The main function of this *ChRIS* plugin is denoted by this ``@chris_plugin`` "decorator."
-# Some metadata about the plugin is specified here. There is more metadata specified in setup.py.
-#
+def weights_load(options: Namespace, inputdir: Path, device):
+    """Build the network and load ``--weights`` into it."""
+    weights = resolve_path(options.weights, inputdir)
+    if weights is None or not weights.is_file():
+        raise FileNotFoundError(
+            f"No checkpoint at {weights}. Give --weights; a relative path is under the input directory."
+        )
+    model = SimpleCNN().to(device)
+    load_checkpoint(model, str(weights), map_location=device)
+    return model
+
+
+def train(options: Namespace, outputdir: Path) -> None:
+    """Train on MNIST; write ``best.ckpt`` and ``train_metrics.txt`` to the output directory."""
+    cfg = TrainConfig(
+        epochs=options.epochs,
+        batch_size=options.batch_size,
+        lr=options.lr,
+        seed=options.seed,
+        num_workers=options.num_workers,
+        out_dir=str(outputdir),
+        device=options.device,
+        amp=options.amp,
+        weight_decay=options.weight_decay,
+    )
+    loaders = mnist_loaders(batch_size=cfg.batch_size, num_workers=cfg.num_workers)
+    history, best_path = train_model(cfg, loaders, SimpleCNN)
+    (outputdir / "train_metrics.txt").write_text(
+        f"best_ckpt={best_path.name}\n"
+        f"last_train_loss={history['train_loss'][-1]:.4f}\n"
+        f"last_val_loss={history['validation_loss'][-1]:.4f}\n"
+        f"last_val_acc={history['validation_accuracy'][-1]:.2f}\n"
+        f"learning_rate={cfg.lr:.5f}\nbatch_size={cfg.batch_size}\nepochs={cfg.epochs}\n"
+    )
+    print(f"[train] wrote {best_path.name} and train_metrics.txt")
+
+
+def evaluate(options: Namespace, inputdir: Path, outputdir: Path) -> None:
+    """Score a checkpoint on the MNIST test set; write ``eval.txt``."""
+    device = get_device(options.device)
+    model = weights_load(options, inputdir, device)
+    _, test_loader = mnist_loaders(batch_size=options.batch_size, num_workers=options.num_workers)
+    loss, acc = evaluate_model(model, test_loader, device)
+    (outputdir / "eval.txt").write_text(f"loss={loss:.4f}\nacc={acc:.2f}\n")
+    print("[eval] wrote eval.txt")
+
+
+def predict(options: Namespace, inputdir: Path, outputdir: Path) -> None:
+    """Predict the digit in one image, or in every image matching ``--pattern``."""
+    device = get_device(options.device)
+    model = weights_load(options, inputdir, device)
+
+    if options.image:
+        image_path = resolve_path(options.image, inputdir)
+        if image_path is None or not image_path.is_file():
+            raise FileNotFoundError(
+                f"No image at {image_path}. A relative --image is under the input directory."
+            )
+        digit, confidence = predict_image(model, image_path, device)
+        (outputdir / "prediction.txt").write_text(
+            f"file={image_path.name}\ndigit={digit}\nconfidence={confidence:.2f}\n"
+        )
+        print("[predict] wrote prediction.txt")
+        return
+
+    # Mirror the input tree: in/d1/a.png -> out/d1/a.pred.txt
+    mapper = PathMapper.file_mapper(
+        inputdir, outputdir, glob=options.pattern, suffix=options.suffix, fail_if_empty=False
+    )
+    rows = []
+    for input_file, output_file in mapper:
+        if not input_file.is_file():
+            continue
+        digit, confidence = predict_image(model, input_file, device)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(f"digit={digit}\nconfidence={confidence:.2f}\n")
+        rows.append((str(input_file.relative_to(inputdir)), digit, f"{confidence:.2f}"))
+
+    if not rows:
+        raise FileNotFoundError(
+            f"No image matched --pattern '{options.pattern}' in the input directory."
+        )
+    with (outputdir / "results.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["relative_path", "predicted_digit", "confidence_percent"])
+        writer.writerows(sorted(rows))
+    print(f"[predict] {len(rows)} images; wrote results.csv and one '{options.suffix}' file per image")
+
+
 # documentation: https://fnndsc.github.io/chris_plugin/chris_plugin.html#chris_plugin
 @chris_plugin(
     parser=parser,
-    title='MNIST Classifier ChRIS Plugin',
-    category='',                 # ref. https://chrisstore.co/plugins
+    title='MNIST digit classifier (small CNN): train, evaluate, predict',
+    category='Machine Learning',
     min_memory_limit='2Gi',      # supported units: Mi, Gi
     min_cpu_limit='1000m',       # millicores, e.g. "1000m" = 1 CPU core
     min_gpu_limit=0              # set min_gpu_limit=1 to enable GPU
 )
-# Single entrypoint to this plugin. See README.md for usage.
 def main(options: Namespace, inputdir: Path, outputdir: Path):
     """
-    *ChRIS* plugins usually have two positional arguments: an **input directory** containing
-    input files and an **output directory** where to write output files. Command-line arguments
-    are passed to this main method implicitly when ``main()`` is called below without parameters.
+    Run the mode asked for.
 
     :param options: non-positional arguments parsed by the parser given to @chris_plugin
     :param inputdir: directory containing (read-only) input files
     :param outputdir: directory where to write output files
     """
+    print(DISPLAY_TITLE, file=sys.stderr)
+    if options.mode == "train":
+        train(options, outputdir)
+    elif options.mode == "eval":
+        evaluate(options, inputdir, outputdir)
+    else:
+        predict(options, inputdir, outputdir)
 
-    # Causing miniChRIS local instance issues (printing to terminal)
-    if not _is_info_probe():
-        print(DISPLAY_TITLE, file=sys.stderr)
-
-    print_dir_tree(inputdir, "inputdir")
-    print_dir_tree(outputdir, "outputdir")
-
-    mode = options.mode
-    device = get_device(options.device)
-
-    # TRAINING MODE 
-    if mode == "train":
-        # Assign the CL arguments to config object (call constructor)
-        cfg = TrainConfig(
-            epochs=options.epochs,
-            batch_size=options.batch_size,
-            lr=options.lr,
-            seed=options.seed,
-            num_workers=options.num_workers,
-            out_dir=str(outputdir),
-            device=options.device,
-            amp=options.amp,
-            weight_decay=options.weight_decay,
-        )
-        # Keep this line below?
-        prep_dataset_root(outputdir)
-        train_loader, test_loader = mnist_loaders(batch_size=cfg.batch_size, num_workers=cfg.num_workers)
-        history, best_path = train_model(cfg, (train_loader, test_loader), SimpleCNN)
-
-        # create a .txt summary file in outputdir (note to self: maybe add this as debug mode only)
-        (outputdir / "train_metrics.txt").write_text(
-            f"best_ckpt={best_path}\n"
-            f"last_train_loss={history['train_loss'][-1]:.4f}\n"
-            f"last_val_loss={history['validation_loss'][-1]:.4f}\n"
-            f"last_val_acc={history['validation_accuracy'][-1]:.2f}\n"
-            f"learning rate={cfg.lr:.5f}\nbatch_size={cfg.batch_size}\nepochs={cfg.epochs}\n"
-        )
-        print(f"[train] Wrote checkpoint and metrics to: {outputdir}")
-
-    # EVALUATION MODE
-    elif mode == "eval":
-        weights = resolve_path(options.weights, inputdir)
-        if weights is None or not weights.exists():
-            raise FileNotFoundError("Please provide --weights (file must exist). "
-                                    "Relative paths are resolved against inputdir.")
-        model = SimpleCNN().to(device)
-        # Keep this line below?
-        prep_dataset_root(outputdir)
-        load_checkpoint(model, str(weights), map_location=device)
-        _, test_loader = mnist_loaders(batch_size=options.batch_size, num_workers=options.num_workers)
-
-        # Model evaluation call from utils.py
-        loss, acc = _eval(model, test_loader, device)
-
-        (outputdir / "eval.txt").write_text(f"loss={loss:.4f}\nacc={acc:.2f}\n")
-        print(f"[eval] Wrote eval metrics to: {outputdir}")
-
-    # PREDICTING MODE (PNG/JPG)
-    elif mode == "predict":
-        # Resolve weights (absolute path instead of using relative to inputfir)
-        weights = resolve_path(options.weights, inputdir)
-        if weights is None or not weights.exists():
-            print(weights)
-            raise FileNotFoundError("Please provide --weights (file must exist). "
-                                    "Relative paths are resolved against inputdir.")
-
-        # Load model
-        model = SimpleCNN().to(device)
-        load_checkpoint(model, str(weights), map_location=device)
-        model.eval()
-
-        # SINGLE-IMAGE MODE 
-        if options.image:
-            image_path = resolve_path(options.image, inputdir)
-            print(f"Predict on single image mode. Looking for image at: {image_path}")
-            if image_path is None or not image_path.exists():
-                raise FileNotFoundError("Please provide --image (file must exist). "
-                                        "Relative paths are resolved against inputdir.")
-            x = preprocess_image(image_path).to(device)
-            with torch.no_grad():
-                logits = model(x)
-                probs = torch.softmax(logits, dim=1).squeeze(0)
-                pred = int(torch.argmax(probs).item())
-                conf = float(probs[pred].item()) * 100.0
-
-            (outputdir / "prediction.txt").write_text(f"file={image_path.name}\ndigit={pred}\nconfidence={conf:.2f}\ninput path={image_path}")
-            print(f"[predict] Single image done. See: {outputdir/'prediction.txt'}")
-            return
-
-        # DIRECTORY (BATCH) PREDICTION MODE 
-        # PathMapper to mirror input->output paths and write per file results
-        # Example: input: /in/d1/a.png  => output: /out/d1/a.png.pred.txt
-        mapper = PathMapper.file_mapper(
-            input_dir=inputdir,            # source dir
-            output_dir=outputdir,           # dest dir
-            glob=options.pattern,
-            suffix=options.suffix
-        )
-
-        # Collect vals for a summary CSV
-        rows = []
-        num_files = 0
-
-        for input_file, output_file in mapper:
-            # Skip non-files
-            if not input_file.is_file():
-                continue
-            num_files += 1
-
-            # Predict on image
-            x = preprocess_image(input_file).to(device)
-            with torch.no_grad():
-                logits = model(x)
-                probs = torch.softmax(logits, dim=1).squeeze(0)
-                pred = int(torch.argmax(probs).item())
-                conf = float(probs[pred].item()) * 100.0
-
-            # Write per-file output
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            output_file.write_text(f"Predicted digit={pred}\nconfidence={conf:.2f}\n")
-
-            # Appending for the summary
-            rows.append((str(input_file.relative_to(inputdir)), pred, conf))
-
-        if num_files == 0:
-            raise FileNotFoundError(
-                f"No images matched pattern '{options.pattern}' under {inputdir}. "
-                "Adjust --pattern (e.g. '**/*.png' or '**/*.[pj][pn]g')."
-            )
-
-        # Write the summary CSV 
-        summary_csv = outputdir / "results.csv"
-        with summary_csv.open("w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["relative_path", "predicted_digit", "confidence_percent"])
-            w.writerows(rows)
-
-        print(f"[predict] Batch done: {num_files} files")
-        print(f"[predict] Per-file outputs under: {outputdir} (suffix='{options.suffix}')")
-        print(f"[predict] Summary CSV: {summary_csv}")
 
 if __name__ == '__main__':
     main()
