@@ -1,255 +1,117 @@
-# _ChRIS_ MNIST Classifier Plugin for Federated Learning Pipeline Validation
+# pl-mnist_cnn
 
-<!-- BEGIN README TEMPLATE
+[![MIT License](https://img.shields.io/github/license/fnndsc/pl-mnist_cnn)](https://github.com/FNNDSC/pl-mnist_cnn/blob/main/LICENSE)
+[![ci](https://github.com/FNNDSC/pl-mnist_cnn/actions/workflows/ci.yml/badge.svg)](https://github.com/FNNDSC/pl-mnist_cnn/actions/workflows/ci.yml)
 
-# ChRIS Plugin Title
+`pl-mnist_cnn` is a [_ChRIS_](https://chrisproject.org/) _ds_ plugin that trains a small
+convolutional network to read handwritten digits, scores it, and uses it to label images.
 
-[![Version](https://img.shields.io/docker/v/fnndsc/pl-appname?sort=semver)](https://hub.docker.com/r/fnndsc/pl-appname)
-[![MIT License](https://img.shields.io/github/license/fnndsc/pl-appname)](https://github.com/FNNDSC/pl-appname/blob/main/LICENSE)
-[![ci](https://github.com/FNNDSC/pl-appname/actions/workflows/ci.yml/badge.svg)](https://github.com/FNNDSC/pl-appname/actions/workflows/ci.yml)
+It is the smallest complete machine-learning plugin there is: one model, three modes, a
+checkpoint that passes from one run to the next. The task is the MNIST digits, which a
+laptop CPU learns to 98% in about a minute, so the whole cycle of train, evaluate and
+predict can be run and understood in one sitting. Use it to learn how a model lives in
+_ChRIS_, to test a compute environment, or as the skeleton for a plugin whose model matters.
 
-`pl-appname` is a [_ChRIS_](https://chrisproject.org/)
-_ds_ plugin which takes in ...  as input files and
-creates ... as output files.
+## What it does
 
-## Abstract
+| `--mode` | reads | writes |
+|---|---|---|
+| `train` | nothing from the input directory; downloads MNIST | `best.ckpt`, `train_metrics.txt` |
+| `eval` | a checkpoint; downloads MNIST | `eval.txt`: loss and accuracy on the 10,000 test images |
+| `predict` | a checkpoint and one or more images | per image, the digit and the model's confidence; `results.csv` |
 
-...
+The modes chain: the output of a `train` run is the input of an `eval` or `predict` run.
+In `predict` mode the input directory holds both the checkpoint and the images.
 
-## Installation
+Any image is accepted in `predict` mode; it is converted to greyscale and resized to 28 by 28.
+The model was trained on white digits on a black background and expects the same.
 
-`pl-appname` is a _[ChRIS](https://chrisproject.org/) plugin_, meaning it can
-run from either within _ChRIS_ or the command-line.
+`train` and `eval` download the MNIST dataset (about 12 MB) on each run, so they need
+network access. `predict` does not.
 
-## Local Usage
+## Running it
 
-To get started with local command-line usage, use [Apptainer](https://apptainer.org/)
-(a.k.a. Singularity) to run `pl-appname` as a container:
-
-```shell
-apptainer exec docker://fnndsc/pl-appname commandname [--args values...] input/ output/
-```
-
-To print its available options, run:
-
-```shell
-apptainer exec docker://fnndsc/pl-appname commandname --help
-```
-
-## Examples
-
-`commandname` requires two positional arguments: a directory containing
-input data, and a directory where to create output data.
-First, create the input directory and move input data into it.
+`pl-mnist_cnn` runs from within _ChRIS_ or from the command line. Its command is `mnist_cnn`,
+and like every _ds_ plugin it takes an input directory and an output directory.
 
 ```shell
-mkdir incoming/ outgoing/
-mv some.dat other.dat incoming/
-apptainer exec docker://fnndsc/pl-appname:latest commandname [--args] incoming/ outgoing/
+mkdir -p in trained scored predicted
+
+# train for two epochs
+docker run --rm -v $PWD/in:/incoming:ro -v $PWD/trained:/outgoing \
+    ghcr.io/fnndsc/pl-mnist_cnn mnist_cnn --mode train --epochs 2 /incoming /outgoing
+
+# score the checkpoint that run wrote
+docker run --rm -v $PWD/trained:/incoming:ro -v $PWD/scored:/outgoing \
+    ghcr.io/fnndsc/pl-mnist_cnn mnist_cnn --mode eval /incoming /outgoing
+
+# label images: put PNGs beside best.ckpt, anywhere under the input directory
+cp digit-*.png trained/
+docker run --rm -v $PWD/trained:/incoming:ro -v $PWD/predicted:/outgoing \
+    ghcr.io/fnndsc/pl-mnist_cnn mnist_cnn --mode predict /incoming /outgoing
 ```
+
+`predicted/results.csv` then reads:
+
+```
+relative_path,predicted_digit,confidence_percent
+digit-0.png,7,99.99
+digit-1.png,2,99.98
+```
+
+and beside it, mirroring the input tree, is one result file per image (`digit-0.pred.txt`). With
+`--image <file>` only that image is read, and the answer is written to `prediction.txt`.
+
+## Options
+
+| option | default | |
+|---|---|---|
+| `--mode` | required | `train`, `eval` or `predict` |
+| `--epochs` | 3 | training epochs |
+| `--batch-size` | 128 | batch size |
+| `--lr` | 0.001 | learning rate |
+| `--weight-decay` | 0.0 | weight decay |
+| `--seed` | 1337 | random seed |
+| `--num-workers` | 2 | data loader processes; 0 loads in the main process |
+| `--device` | `auto` | `auto`, `cpu`, `cuda` or `mps` |
+| `--amp` | off | mixed precision; has an effect on a CUDA device only |
+| `--weights` | `best.ckpt` | checkpoint to load; a relative path is under the input directory |
+| `--image` | | predict this one image instead of every match of `--pattern` |
+| `--pattern` | `**/*.png` | glob of the images to predict, under the input directory |
+| `--suffix` | `.pred.txt` | suffix of the per-image result files |
+
+The published image carries PyTorch's CPU build, so `--device auto` resolves to the CPU there.
+
+## The model
+
+Two 3x3 convolutions (32 and 64 channels), one 2x2 max pool, dropout, and two dense layers
+(128 units, then 10). It is trained with AdamW and cross-entropy loss, and the checkpoint kept
+is the epoch with the best accuracy on the test set. The code is in [`mnist_cnn/`](mnist_cnn).
 
 ## Development
 
-Instructions for developers.
+```shell
+python -m venv .venv
+.venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu -e '.[dev]'
+.venv/bin/pytest
+```
 
-### Building
-
-Build a local container image:
+The tests need no network and no trained model. To build the image:
 
 ```shell
-docker build -t localhost/fnndsc/pl-appname .
+docker build -t localhost/fnndsc/pl-mnist_cnn .
+docker run --rm localhost/fnndsc/pl-mnist_cnn mnist_cnn --help
 ```
 
-### Running
+A version tag (`1.2.3` or `v1.2.3`) pushed to this repository builds the image and publishes it
+to `docker.io/fnndsc/pl-mnist_cnn` and `ghcr.io/fnndsc/pl-mnist_cnn`. The version is
+`__version__` in `app.py`.
 
-Mount the source code `app.py` into a container to try out changes without rebuild.
+## Origin
 
-```shell
-docker run --rm -it --userns=host -u $(id -u):$(id -g) \
-    -v $PWD/app.py:/usr/local/lib/python3.12/site-packages/app.py:ro \
-    -v $PWD/in:/incoming:ro -v $PWD/out:/outgoing:rw -w /outgoing \
-    localhost/fnndsc/pl-appname commandname /incoming /outgoing
-```
-
-### Testing
-
-Run unit tests using `pytest`.
-It's recommended to rebuild the image to ensure that sources are up-to-date.
-Use the option `--build-arg extras_require=dev` to install extra dependencies for testing.
-
-```shell
-docker build -t localhost/fnndsc/pl-appname:dev --build-arg extras_require=dev .
-docker run --rm -it localhost/fnndsc/pl-appname:dev pytest
-```
-
-## Release
-
-Steps for release can be automated by [Github Actions](.github/workflows/ci.yml).
-This section is about how to do those steps manually.
-
-### Increase Version Number
-
-Increase the version number in `setup.py` and commit this file.
-
-### Push Container Image
-
-Build and push an image tagged by the version. For example, for version `1.2.3`:
-
-```
-docker build -t docker.io/fnndsc/pl-appname:1.2.3 .
-docker push docker.io/fnndsc/pl-appname:1.2.3
-```
-
-### Get JSON Representation
-
-Run [`chris_plugin_info`](https://github.com/FNNDSC/chris_plugin#usage)
-to produce a JSON description of this plugin, which can be uploaded to _ChRIS_.
-
-```shell
-docker run --rm docker.io/fnndsc/pl-appname:1.2.3 chris_plugin_info -d docker.io/fnndsc/pl-appname:1.2.3 > chris_plugin_info.json
-```
-
-Intructions on how to upload the plugin to _ChRIS_ can be found here:
-https://chrisproject.org/docs/tutorials/upload_plugin
-
-END README TEMPLATE -->
-
-## How to use this plugin locally:
-### Setup
-```bash
-python -m venv .venv_mnist && source .venv_mnist/bin/activate
-pip install -r requirements.txt
-```
-
-### Train 
-```bash
-cd MNIST_root
-python main_MNIST.py train --epochs 6 --batch-size 128 --lr 1e-3 --out-dir outputs
-
-# OR GENERALLY:
-
-python main_MNIST.py train --epochs 6 --batch-size 128 --lr 1e-3 --out-dir <path/to/output/directory>
-``` 
-* Note that more hyperparameters for training can be passed as command line arguments, look in main.py for more options.
-
-### Evaluate
-```bash
-cd MNIST_root
-python main_MNIST.py eval --weights outputs/best.ckpt
-
-# OR GENERALLY:
-
-python main_MNIST.py eval --weights <path/to/weights/best.ckpt>
-```
-
-### Predict on Single Image:
-
-```bash
-cd MNIST_root
-python main_MNIST.py predict --weights outputs/best.ckpt --image <path/to/img.png>
-```
-
-## How to use as a ChRIS plugin:
-
-### 1. Setup
-```bash
-source .venv_mnist/bin/activate
-pip install -e .
-```
-Next, you want to run the following command to ensure the setup is properly working:
-
-```bash
-chrNIST --help  # Ensure this command works without throwing errors.
-```
-
-### 2. Train
-
-Ensure this training runs properly without issues before building the container.
-```bash
-mkdir in
-chrNIST --mode train --epochs 4 --batch-size 128 --lr 1e-3 . MNIST_root/outputs
-```
-
-Note that `commandname` is `chrNIST` in this plugin.
-
-### 3. Evaluate
-
-Ensure this eval properly without issues before building the container.
-```bash
-chrNIST --mode eval --weights MNIST_root/outputs/best.ckpt . MNIST_root/outputs
-```
-
-### 4. Build docker image
-
-From the plugin's root directory, run:
-```bash
-docker build -t jedelist/mnist-chris:latest .
-
-# Ensure the following help command runs properly in the container without throwing errors
-docker run --rm jedelist/mnist-chris:latest chrNIST --help
-```
-
-### 5. Run training inside a container 
-
-```bash
-docker run --rm \
-  -e OMP_NUM_THREADS=4 -e MKL_NUM_THREADS=4 \
-  -v "$PWD/in:/in:ro" \
-  -v "$PWD/MNIST_root/outputs:/out" \
-  jedelist/mnist-chris:latest \
-  chrNIST --mode train --epochs 1 --batch-size 64 --lr 1e-3 --num-workers 0 \
-  /in /out
-```
-
-Note: If you want to use AMP, just leave the argument empty, it will be on by default. If you're not using CUDA and don't want to use AMP, also leave it blank. PyTorch will automatically disable AMP (mixed precision). I cannot get the CL argument to behave well- so for now this will have to do.
-
-### 6. Evaluate trained model inside container
-
-```bash
-docker run --rm \
-  -e OMP_NUM_THREADS=4 -e MKL_NUM_THREADS=4 \
-  -v "$PWD/in:/in:ro" \
-  -v "$PWD/MNIST_root/outputs:/out" \
-  jedelist/mnist-chris:latest \
-  chrNIST --mode eval --weights /out/best.ckpt --num-workers 0 \
-  /in /out
-
-  # Or use --weights best.ckpt if your weights are stored in in/best.ckpt
-```
-
-### 7. Predict on images (PNG/JPG)
-
-To predict on a single image: 
-```bash
-# Example: Put a PNG to ./in/digit.png
-docker run --rm \
-  -v "$PWD/in:/in:ro" \
-  -v "$PWD/MNIST_root/outputs:/out" \
-  jedelist/mnist-chris:latest \
-  chrNIST --mode predict --weights out/best.ckpt --image digit.png \
-  /in /out
-```
-Example: `--image batch/mnist_png/test/9/7.png`
-The output and results will be stored in `/out` (or whatever outputdir is set to)
-
-Predict on a batch of images (a bunch of PNG images in a directory):
-```bash
-# put a bunch of PNGs under ./in/ (can be nested)
-docker run --rm \
-  -v "$PWD/in:/in:ro" \
-  -v "$PWD/MNIST_root/outputs:/out" \
-  jedelist/mnist-chris:latest \
-  chrNIST --mode predict --weights /out/best.ckpt --pattern "batch/mnist_png/test/6/*.png" \
-  /in /out
-```
-Examples:
-* JPGs: `--pattern "**/*.jpg" ` for all JPGs in outputdir recursively
-* All PNG/JPG: `--pattern "**/*.[pj][pn]g"` for all JPGs and PNGs in outputdir recursively
-
-Note: To cleanup unused all unused containers and images, run: `docker system prune -a`
-
-Ran in miniChRIS UI using:
-```bash
-chrNIST --mode predict \ --weights "home_chris_uploads_Feed for UI_feed_data_Oct_26__2025__11_42_PM_UI_feed_data/best.ckpt" \ --image "home_chris_uploads_Feed for UI_feed_data_Oct_26__2025__11_42_PM_UI_feed_data/35.png" \ --num-workers 0
-```
-* Note to self: need to find a cleaner way to leverage inputdir to get these paths to be more elegant.
+Written by David Edelist as `pl-chrNIST`, for the Boston University EC528 Fall 2025 project
+[Federated Learning in Medical Imaging Using the ChRIS Platform](https://github.com/EC528-Fall-2025/FedMed-ChRIS).
+It was that project's first milestone: a model training and predicting inside _ChRIS_, before
+training was spread across sites with [pl-superlink](https://github.com/FNNDSC/pl-superlink)
+and [pl-supernode](https://github.com/FNNDSC/pl-supernode). This plugin does not itself take
+part in federated training.

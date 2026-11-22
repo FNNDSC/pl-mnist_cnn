@@ -1,7 +1,9 @@
-from setuptools import setup
 import re
 
+from setuptools import setup
+
 _version_re = re.compile(r"(?<=^__version__ = (\"|'))(.+)(?=\"|')")
+
 
 def get_version(rel_path: str) -> str:
     """
@@ -19,31 +21,37 @@ def get_version(rel_path: str) -> str:
 
 
 setup(
-    name='pl-chrNIST',
+    name='pl-mnist_cnn',
     version=get_version('app.py'),
-    description='A Simple ChRIS plugin for MNIST Classification. Used to validate Federated Learning Pipeline.',
+    description='Train, evaluate, or predict with a small CNN on MNIST handwritten digits.',
     author='David Edelist',
     author_email='jedelist@bu.edu',
-    url='https://github.com/jedelist/MNIST_plugin',
-    py_modules=['app'],                  # the ChRIS main entrypoint app.py
-    packages=['MNIST_root'],             # MNIST package (src)
-    install_requires=['chris_plugin==0.4.0'],
+    url='https://github.com/FNNDSC/pl-mnist_cnn',
+    py_modules=['app'],
+    packages=['mnist_cnn'],
+    install_requires=[
+        'chris_plugin==0.4.0',
+        'torch>=2.2',
+        'torchvision>=0.17',
+        'numpy',
+        'tqdm>=4.66',
+        'Pillow>=10.0',
+    ],
     license='MIT',
     entry_points={
         'console_scripts': [
-            'chrNIST = app:main'     # becomes the container CMD
+            'mnist_cnn = app:main'
         ]
     },
     classifiers=[
         'License :: OSI Approved :: MIT License',
         'Topic :: Scientific/Engineering',
-        'Topic :: Scientific/Engineering :: Bio-Informatics',
-        'Topic :: Scientific/Engineering :: Medical Science Apps.'
+        'Topic :: Scientific/Engineering :: Artificial Intelligence',
     ],
     extras_require={
         'none': [],
         'dev': [
-            'pytest~=7.1'
+            'pytest~=8.0'
         ]
     }
 )

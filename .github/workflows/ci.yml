@@ -4,7 +4,7 @@
 # - on push and PR: run pytest
 # - on push to main: build and push container images as ":latest"
 # - on push to semver tag: build and push container image with tag and
-#                          upload plugin description to https://chrisstore.co
+#                          upload plugin description to cube.chrisproject.org
 
 name: build
 
@@ -19,7 +19,6 @@ on:
 jobs:
   test:
     name: Unit tests
-    if: false  # delete this line to enable automatic testing
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -41,9 +40,8 @@ jobs:
 
   build:
     name: Build
-    if: false  # delete this line and uncomment the line below to enable automatic builds
-    # if: github.event_name == 'push' || github.event_name == 'release'
-    # needs: [ test ]  # uncomment to require passing tests
+    if: github.event_name == 'push' || github.event_name == 'release'
+    needs: [ test ]
     runs-on: ubuntu-22.04
 
     steps:
@@ -164,6 +162,7 @@ jobs:
       - name: Upload ChRIS Plugin
         id: upload
         if: github.ref_type == 'tag'
+        continue-on-error: true  # the public store is not always up; the image is what matters
         uses: FNNDSC/upload-chris-plugin@v1
         with:
           dock_image: ${{ steps.info.outputs.local_tag }}
